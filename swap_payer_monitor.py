@@ -1312,7 +1312,7 @@ def main() -> None:
     import streamlit as st
 
     st.set_page_config(page_title="G4 Payer Monitor", layout="wide")
-    st.title("G4 10y Payer Monitor — SOFR · €STR · SONIA · CORRA")
+    st.title("Anthony Rottino Rate Strategy Dashboard")
 
     with st.sidebar:
         bbg_ok = bloomberg_available()
