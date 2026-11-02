@@ -109,6 +109,151 @@ def fetch_bloomberg(start: dt.date, end: dt.date) -> tuple[pd.DataFrame, list[st
     return px.sort_index().ffill().dropna(how="all"), missing
 
 
+# --------------------------------------------------------------------------
+# PUBLIC DATA: government bond yields + overnight fixings (free, no licence)
+# --------------------------------------------------------------------------
+# Government curves stand in for the OIS curves; fixings are the real RFRs.
+# Swap spreads, France stress, Bund ASW and MOVE are not available (skipped).
+PUBLIC = {
+    "usd": dict(src="fred", curve={2: "DGS2", 5: "DGS5", 7: "DGS7", 10: "DGS10", 20: "DGS20", 30: "DGS30"},
+                fix="SOFR", be10="T10YIE"),
+    "eur": dict(src="ecb", curve={t: f"SR_{t}Y" for t in (2, 5, 9, 10, 15, 20, 25, 30)},
+                fix="EST/B.EU000A2X2A25.WT"),
+    "gbp": dict(src="boe", curve={5: "IUDMNZC", 10: "IUDSNZC", 20: "IUDLNZC"}, fix="IUDSOIA"),
+    "cad": dict(src="boc", curve={2: "BD.CDN.2YR.DQ.YLD", 5: "BD.CDN.5YR.DQ.YLD", 7: "BD.CDN.7YR.DQ.YLD",
+                                  10: "BD.CDN.10YR.DQ.YLD", 30: "BD.CDN.LONG.DQ.YLD"}, fix="AVG.INTWO"),
+}
+PUBLIC_LABEL = {"usd": "US Treasuries (FRED)", "eur": "Euro area AAA curve (ECB)",
+                "gbp": "Gilts, nominal zero-coupon (BoE)", "cad": "GoC benchmarks (Bank of Canada)"}
+_UA = {"User-Agent": "Mozilla/5.0 (G4 payer monitor; research use)"}
+
+
+def _get(url: str, timeout: int = 40) -> str:
+    import requests
+    r = requests.get(url, headers=_UA, timeout=timeout)
+    r.raise_for_status()
+    return r.text
+
+
+def parse_fred_csv(text: str) -> pd.DataFrame:
+    import io
+    df = pd.read_csv(io.StringIO(text))
+    df.index = pd.to_datetime(df.iloc[:, 0])
+    return df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce")
+
+
+def parse_ecb_csv(text: str, key_col: str) -> pd.Series | pd.DataFrame:
+    import io
+    df = pd.read_csv(io.StringIO(text))
+    df["TIME_PERIOD"] = pd.to_datetime(df["TIME_PERIOD"])
+    df["OBS_VALUE"] = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
+    if key_col in df:
+        return df.pivot_table(index="TIME_PERIOD", columns=key_col, values="OBS_VALUE")
+    return df.set_index("TIME_PERIOD")["OBS_VALUE"]
+
+
+def parse_boc_json(text: str) -> pd.DataFrame:
+    import json
+    obs = json.loads(text)["observations"]
+    rows = {o["d"]: {k: v.get("v") for k, v in o.items() if isinstance(v, dict)} for o in obs}
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    df.index = pd.to_datetime(df.index)
+    return df.apply(pd.to_numeric, errors="coerce")
+
+
+def parse_boe_csv(text: str) -> pd.DataFrame:
+    import io
+    df = pd.read_csv(io.StringIO(text))
+    df.index = pd.to_datetime(df.iloc[:, 0], format="%d %b %Y", errors="coerce")
+    return df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce")[lambda x: x.index.notna()]
+
+
+def _fetch_source(c: str, cfg: dict, start: dt.date) -> pd.DataFrame:
+    """One DataFrame per currency: columns = curve tenors (int) + 'fix' (+ 'be10')."""
+    codes = list(cfg["curve"].values())
+    if cfg["src"] == "fred":
+        ids = codes + [cfg["fix"]] + ([cfg["be10"]] if cfg.get("be10") else [])
+        raw = parse_fred_csv(_get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=" + ",".join(ids)
+                                  + f"&cosd={start:%Y-%m-%d}"))
+        out = pd.DataFrame({t: raw[code] for t, code in cfg["curve"].items()})
+        out["fix"] = raw[cfg["fix"]]
+        if cfg.get("be10"):
+            out["be10"] = raw[cfg["be10"]]
+    elif cfg["src"] == "ecb":
+        base = "https://data-api.ecb.europa.eu/service/data/"
+        yc = parse_ecb_csv(_get(f"{base}YC/B.U2.EUR.4F.G_N_A.SV_C_YM.{'+'.join(codes)}"
+                                f"?format=csvdata&startPeriod={start:%Y-%m-%d}"), "DATA_TYPE_FM")
+        out = pd.DataFrame({t: yc[code] for t, code in cfg["curve"].items() if code in yc})
+        fx = parse_ecb_csv(_get(f"{base}{cfg['fix']}?format=csvdata&startPeriod={start:%Y-%m-%d}"), "_none_")
+        out["fix"] = fx
+    elif cfg["src"] == "boe":
+        url = ("https://www.bankofengland.co.uk/boeapps/database/_iadb-fromshowcolumns.asp?csv.x=yes"
+               f"&Datefrom={start:%d/%b/%Y}&Dateto=now&SeriesCodes={','.join(codes + [cfg['fix']])}"
+               "&CSVF=TN&UsingCodes=Y&VPD=Y&VFD=N")
+        raw = parse_boe_csv(_get(url))
+        out = pd.DataFrame({t: raw[code] for t, code in cfg["curve"].items() if code in raw})
+        out["fix"] = raw[cfg["fix"]] if cfg["fix"] in raw else np.nan
+    elif cfg["src"] == "boc":
+        ids = codes + [cfg["fix"]]
+        raw = parse_boc_json(_get("https://www.bankofcanada.ca/valet/observations/" + ",".join(ids)
+                                  + f"/json?start_date={start:%Y-%m-%d}"))
+        out = pd.DataFrame({t: raw[code] for t, code in cfg["curve"].items() if code in raw})
+        out["fix"] = raw[cfg["fix"]] if cfg["fix"] in raw else np.nan
+    else:
+        raise ValueError(cfg["src"])
+    return out.sort_index()
+
+
+def assemble_public(frames: dict[str, pd.DataFrame], start: dt.date, end: dt.date) -> pd.DataFrame:
+    """Map per-currency government curves onto the model's columns (same layout as Bloomberg)."""
+    idx = pd.bdate_range(start, end)
+    cols = {k: np.nan for k in ticker_map()}
+    px = pd.DataFrame(cols, index=idx)
+
+    def interp(d: pd.DataFrame, t: float) -> pd.Series:
+        ts = sorted(c for c in d.columns if isinstance(c, (int, np.integer)))
+        if t in ts:
+            return d[t]
+        lo = max([x for x in ts if x < t], default=None)
+        hi = min([x for x in ts if x > t], default=None)
+        if lo is None or hi is None:
+            return pd.Series(np.nan, index=d.index)
+        w = (t - lo) / (hi - lo)
+        return (1 - w) * d[lo] + w * d[hi]
+
+    for c, d in frames.items():
+        d = d.reindex(idx).ffill(limit=5)
+        for t in TENORS:
+            if t in d.columns:
+                px[f"{c}_c{t}"] = d[t]
+        for k, t in [("s2", 2), ("s9", 9), ("s10", 10), ("s30", 30)]:
+            px[f"{c}_{k}"] = interp(d, t)
+        px[f"{c}_fix"] = d["fix"] if "fix" in d else np.nan
+        if "be10" in d:
+            px[f"{c}_be10"] = d["be10"]
+    return px.dropna(subset=[f"{c}_s10" for c in CCYS], how="any")
+
+
+def fetch_public(start: dt.date, end: dt.date) -> tuple[pd.DataFrame, list[str]]:
+    """Free government-bond and fixing data from FRED, ECB, BoE and Bank of Canada."""
+    frames, problems = {}, []
+    for c, cfg in PUBLIC.items():
+        try:
+            frames[c] = _fetch_source(c, cfg, start)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"{PUBLIC_LABEL[c]}: {type(e).__name__}: {e}"[:200])
+    missing_core = [c for c in CCYS if c not in frames]
+    if missing_core:
+        raise RuntimeError("Public data unavailable for " + ", ".join(c.upper() for c in missing_core)
+                           + " — " + " | ".join(problems))
+    px = assemble_public(frames, start, end)
+    if px.empty:
+        raise RuntimeError("Public data loaded but no common dates with all four 10y yields.")
+    notes = problems + ["Government bond yields used as OIS proxies; swap spreads, France stress, "
+                        "Bund ASW, MOVE and non-USD breakevens are not available from public sources."]
+    return px, notes
+
+
 def make_demo(start: dt.date, end: dt.date, seed: int = 7) -> tuple[pd.DataFrame, list[str]]:
     """Synthetic, mean-reverting, structurally sensible data (incl. a France shock)."""
     idx = pd.bdate_range(start, end)
@@ -606,8 +751,10 @@ def _strategy_stats(pos: pd.Series, pnl: pd.Series, cost_bp: float) -> dict:
     d = daily[live.cumsum() > 0]
     yrs = max(len(d) / 252, 1e-9)
     sd = d.std()
+    cd = d.cumsum()
     return dict(sharpe=float(d.mean() / sd * np.sqrt(252)) if sd > 0 else np.nan,
                 pnl_bp_yr=float(d.sum() / yrs),
+                max_dd_bp=float((cd - cd.cummax()).min()) if len(cd) else np.nan,
                 turnover_yr=float(turn[d.index].sum() / yrs),
                 cum=daily.cumsum())
 
@@ -739,6 +886,44 @@ def backtest_proposed(f: pd.DataFrame, props: list[dict], h: int = BT_H, ic_win:
         r["label"] = sp["label"]
         out[sp["label"]] = r
     return out
+
+
+def money_pnl(bt: dict[str, dict], dv01: dict[str, float],
+              composite: str = "Hand weights") -> tuple[pd.DataFrame, pd.Series]:
+    """Convert bp-per-DV01 backtest P&L into money with the trader's DV01 per strategy.
+
+    One position unit = 1 x DV01 (composites go up to 2 units at full conviction).
+    Returns a per-strategy table and the out-of-sample daily P&L of the whole book
+    (sum of strategies, same DV01s) for the chosen composite.
+    """
+    rows, book = [], []
+    for name, r in bt.items():
+        k = dv01.get(name, 0.0) or 0.0
+        cv = r["conv"]
+        row = {"Trade": name, "Strategy": r.get("label", name), "DV01 per bp": k}
+        for lab, short in [("Hand weights", "Hand"), ("IC-weighted (WF)", "IC-WF")]:
+            c = r["composites"][lab]
+            row[f"{short} P&L/yr"] = c["pnl_bp_yr"] * k
+            row[f"{short} max DD"] = c["max_dd_bp"] * k
+        row["Avg fwd |s|≥1.5"] = cv["avg"] * k if np.isfinite(cv["avg"]) else np.nan
+        row["Avg fwd same side"] = cv["avg_same"] * k if np.isfinite(cv["avg_same"]) else np.nan
+        rows.append(row)
+        cum = r["composites"][composite]["cum"]
+        if r["oos_start"] is not None:
+            cum = cum.loc[r["oos_start"]:]
+        book.append(cum.diff().fillna(0) * k)
+    daily = pd.concat(book, axis=1).fillna(0).sum(axis=1) if book else pd.Series(dtype=float)
+    return pd.DataFrame(rows), daily
+
+
+def book_stats(daily: pd.Series) -> dict:
+    if daily.empty:
+        return dict(pnl_yr=np.nan, sharpe=np.nan, max_dd=np.nan, total=np.nan)
+    cum = daily.cumsum()
+    sd = daily.std()
+    return dict(pnl_yr=float(daily.sum() / max(len(daily) / 252, 1e-9)),
+                sharpe=float(daily.mean() / sd * np.sqrt(252)) if sd > 0 else np.nan,
+                max_dd=float((cum - cum.cummax()).min()), total=float(cum.iloc[-1]))
 
 
 def backtest_summary(bt: dict[str, dict]) -> pd.DataFrame:
@@ -1075,9 +1260,10 @@ def main() -> None:
 
     with st.sidebar:
         bbg_ok = bloomberg_available()
-        sources = (["Bloomberg (xbbg)", "Demo"] if bbg_ok else ["Demo"])
+        sources = (["Bloomberg (xbbg)"] if bbg_ok else []) + ["Public bond data", "Demo"]
         source = st.radio("Data source", sources, index=0,
-                          help=None if bbg_ok else "Bloomberg (xbbg) is not installed here: demo data only.")
+                          help="Public bond data: government yields and fixings from FRED, ECB, "
+                               "Bank of England and Bank of Canada, as proxies for OIS swaps.")
         years = st.slider("History (years)", 1, 10, 5, help="The backtest needs at least 3 years.")
         end = st.date_input("End date", dt.date.today())
         show_n = st.slider("Chart window (days)", 60, 750, 250)
@@ -1088,12 +1274,20 @@ def main() -> None:
         pca_hl = st.select_slider("EW half-life for loadings (days, 0 = equal)",
                                   [0, 21, 42, 63, 84, 126, 189, 252], value=PCA_HL)
         z_thr = st.slider("Signal |z| threshold", 1.0, 3.0, 2.0, step=0.25)
+        st.markdown("**Sizing**")
+        dv01_default = st.number_input("DV01 per strategy (amount per bp)", min_value=0.0,
+                                       value=10_000.0, step=1_000.0, format="%.0f", key="dv01")
+        ccy_lab = st.selectbox("P&L currency", ["EUR", "USD", "GBP", "CAD"], key="dv01_ccy")
 
     start = end - dt.timedelta(days=365 * years + 30)
 
-    @st.cache_data(ttl=900)
+    @st.cache_data(ttl=6 * 3600, show_spinner="Loading data…")
     def load(src: str, s: dt.date, e: dt.date):
-        return make_demo(s, e) if src == "Demo" else fetch_bloomberg(s, e)
+        if src == "Demo":
+            return make_demo(s, e)
+        if src == "Public bond data":
+            return fetch_public(s, e)
+        return fetch_bloomberg(s, e)
 
     try:
         px, missing = load(source, start, end)
@@ -1101,13 +1295,20 @@ def main() -> None:
         st.error(f"Data load failed: {e}")
         st.stop()
     if missing:
-        st.info(f"Tickers not returned (signals using them are skipped): {missing}")
+        if source == "Public bond data":
+            st.info(" · ".join(missing))
+        else:
+            st.info(f"Tickers not returned (signals using them are skipped): {missing}")
 
     f = build_features(px)
     st.caption(f"As of {f.index[-1].date()} · source: {source}")
     if source == "Demo":
         st.warning("Synthetic demo data: levels, signals and backtest results are illustrative only, "
                    "not market data and not investment advice.")
+    elif source == "Public bond data":
+        st.warning("Public data: government bond yields (US Treasuries, euro area AAA curve, gilts, "
+                   "GoC) stand in for OIS swaps, with real overnight fixings. Labels such as 'SOFR' "
+                   "refer to that currency's curve. Not investment advice.")
 
     tab_mkt, tab_strat, tab_bt, tab_rv, tab_data = st.tabs(
         ["Market view", "Strategies", "Backtest", "Curve RV (PCA)", "Data"])
@@ -1150,7 +1351,9 @@ def main() -> None:
                                        (sp["target"], "target", "dash")]:
                     fig.add_hline(y=lvl, line_dash=dash, line_width=1,
                                   annotation_text=f"{lab} {fmt_(lvl)}", annotation_position="left")
-                fig.update_layout(height=300, title=f"{sp['label']} · score {sp['score']:+.2f}",
+                risk_m = sp["sigma"] * dv01_default
+                fig.update_layout(height=300, title=f"{sp['label']} · score {sp['score']:+.2f} · "
+                                                    f"risk {risk_m:,.0f} / reward {2 * risk_m:,.0f} {ccy_lab}",
                                   showlegend=False, margin=dict(l=10, r=10, t=40, b=10))
                 fig.update_yaxes(title_text=sp["series_name"], secondary_y=False)
                 fig.update_yaxes(title_text="Score", secondary_y=True, showgrid=False)
@@ -1218,6 +1421,35 @@ def main() -> None:
             if not bt:
                 st.info("No proposed strategy to test.")
             else:
+                st.markdown(f"**P&L in {ccy_lab}** — one position unit = 1 × DV01; "
+                            "composites reach 2 units at full conviction. Edit DV01 per strategy below.")
+                dv_tbl = pd.DataFrame({"Strategy": [bt[k].get("label", k) for k in bt],
+                                       "DV01 per bp": [dv01_default] * len(bt)}, index=list(bt))
+                dv_edit = st.data_editor(dv_tbl, hide_index=True, disabled=["Strategy"],
+                                         use_container_width=True, key="dv01_editor",
+                                         column_config={"DV01 per bp": st.column_config.NumberColumn(
+                                             format="%.0f", min_value=0.0, step=1000.0)})
+                dv_map = dict(zip(bt.keys(), dv_edit["DV01 per bp"].astype(float)))
+                comp_sel = st.radio("Composite", ["Hand weights", "IC-weighted (WF)"], horizontal=True,
+                                    key="bt_comp")
+                mtab, book = money_pnl(bt, dv_map, comp_sel)
+                bs = book_stats(book)
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric(f"Book P&L / yr ({ccy_lab})", f"{bs['pnl_yr']:,.0f}")
+                k2.metric("Book Sharpe", f"{bs['sharpe']:+.2f}")
+                k3.metric(f"Book max drawdown ({ccy_lab})", f"{bs['max_dd']:,.0f}")
+                k4.metric(f"Book total OOS ({ccy_lab})", f"{bs['total']:,.0f}")
+                money_cols = [c for c in mtab.columns if c not in ("Trade", "Strategy")]
+                st.dataframe(mtab.drop(columns="Trade").style.format(
+                    {c: "{:,.0f}" for c in money_cols}, na_rep="–"),
+                    hide_index=True, use_container_width=True)
+                if not book.empty:
+                    fb = px_.area(book.cumsum().rename(f"Book cumulative P&L ({ccy_lab})"),
+                                  title=f"Book: cumulative out-of-sample P&L, {comp_sel} ({ccy_lab})")
+                    fb.update_layout(height=300, showlegend=False, margin=dict(l=10, r=10, t=40, b=10))
+                    st.plotly_chart(fb, use_container_width=True, key="bt_book")
+
+                st.markdown("**Signal diagnostics (bp per DV01)**")
                 summ_bt = backtest_summary(bt)
                 st.dataframe(summ_bt.drop(columns="Trade").style.format({
                     "Score now": "{:+.2f}", "Sharpe hand": "{:+.2f}", "Sharpe IC-WF": "{:+.2f}",
@@ -1234,7 +1466,11 @@ def main() -> None:
                 if r["oos_start"] is not None:
                     cum = cum.loc[r["oos_start"]:]
                     cum = cum - cum.iloc[0]
-                fig = px_.line(cum, title=f"{r['label']}: cumulative P&L, bp per DV01 (out-of-sample, "
+                in_money = st.toggle(f"Show in {ccy_lab}", value=True, key="bt_money")
+                unit = f"{ccy_lab} at DV01 {dv_map.get(tr, 0):,.0f}" if in_money else "bp per DV01"
+                if in_money:
+                    cum = cum * dv_map.get(tr, 0.0)
+                fig = px_.line(cum, title=f"{r['label']}: cumulative P&L, {unit} (out-of-sample, "
                                           "long/short on the score)")
                 fig.update_layout(height=320, legend_title=None, margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fig, use_container_width=True, key="bt_cum")
