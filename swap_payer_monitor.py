@@ -128,11 +128,60 @@ PUBLIC_LABEL = {"usd": "US Treasuries (FRED)", "eur": "Euro area AAA curve (ECB)
 _UA = {"User-Agent": "Mozilla/5.0 (G4 payer monitor; research use)"}
 
 
-def _get(url: str, timeout: int = 40) -> str:
+def _get(url: str, timeout: tuple = (10, 60), tries: int = 3) -> str:
+    """GET with retries and back-off (public sites can be slow from cloud hosts)."""
+    import time
     import requests
-    r = requests.get(url, headers=_UA, timeout=timeout)
-    r.raise_for_status()
-    return r.text
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=_UA, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(1.5 * (i + 1))
+    raise last
+
+
+def parse_treasury_csv(text: str) -> pd.DataFrame:
+    """home.treasury.gov daily par yield curve CSV -> columns '2 Yr', '10 Yr', ..."""
+    import io
+    df = pd.read_csv(io.StringIO(text))
+    df.index = pd.to_datetime(df["Date"], format="%m/%d/%Y", errors="coerce")
+    return df.drop(columns=["Date"]).apply(pd.to_numeric, errors="coerce")[lambda x: x.index.notna()]
+
+
+def parse_nyfed_json(text: str) -> pd.Series:
+    """markets.newyorkfed.org reference-rate JSON -> Series of percentRate."""
+    import json
+    rows = json.loads(text).get("refRates", [])
+    s = pd.Series({r["effectiveDate"]: r.get("percentRate") for r in rows}, dtype=float)
+    s.index = pd.to_datetime(s.index)
+    return s.sort_index()
+
+
+def _fred_series(code: str, start: dt.date) -> pd.Series:
+    raw = parse_fred_csv(_get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}&cosd={start:%Y-%m-%d}",
+                              timeout=(5, 20), tries=2))
+    return raw.iloc[:, 0]
+
+
+def _usd_fallback(cfg: dict, start: dt.date, end: dt.date) -> pd.DataFrame:
+    """US Treasury par curve (home.treasury.gov) + SOFR (New York Fed) when FRED is down."""
+    cols = {2: "2 Yr", 5: "5 Yr", 7: "7 Yr", 10: "10 Yr", 20: "20 Yr", 30: "30 Yr"}
+    parts = []
+    for yr in range(start.year, end.year + 1):
+        url = ("https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+               f"daily-treasury-rates.csv/{yr}/all?type=daily_treasury_yield_curve"
+               f"&field_tdr_date_value={yr}&page&_format=csv")
+        parts.append(parse_treasury_csv(_get(url)))
+    tr = pd.concat(parts).sort_index()
+    out = pd.DataFrame({t: tr[c] for t, c in cols.items() if c in tr and t in cfg["curve"]})
+    sofr = parse_nyfed_json(_get("https://markets.newyorkfed.org/api/rates/secured/sofr/search.json"
+                                 f"?startDate={start:%Y-%m-%d}&endDate={end:%Y-%m-%d}"))
+    out["fix"] = sofr
+    return out
 
 
 def parse_fred_csv(text: str) -> pd.DataFrame:
@@ -168,17 +217,21 @@ def parse_boe_csv(text: str) -> pd.DataFrame:
     return df.iloc[:, 1:].apply(pd.to_numeric, errors="coerce")[lambda x: x.index.notna()]
 
 
-def _fetch_source(c: str, cfg: dict, start: dt.date) -> pd.DataFrame:
+def _fetch_source(c: str, cfg: dict, start: dt.date, end: dt.date | None = None) -> pd.DataFrame:
     """One DataFrame per currency: columns = curve tenors (int) + 'fix' (+ 'be10')."""
+    end = end or dt.date.today()
     codes = list(cfg["curve"].values())
     if cfg["src"] == "fred":
-        ids = codes + [cfg["fix"]] + ([cfg["be10"]] if cfg.get("be10") else [])
-        raw = parse_fred_csv(_get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=" + ",".join(ids)
-                                  + f"&cosd={start:%Y-%m-%d}"))
-        out = pd.DataFrame({t: raw[code] for t, code in cfg["curve"].items()})
-        out["fix"] = raw[cfg["fix"]]
+        try:
+            out = pd.DataFrame({t: _fred_series(code, start) for t, code in cfg["curve"].items()})
+            out["fix"] = _fred_series(cfg["fix"], start)
+        except Exception:  # noqa: BLE001  -> official US Treasury + NY Fed fallback
+            out = _usd_fallback(cfg, start, end)
         if cfg.get("be10"):
-            out["be10"] = raw[cfg["be10"]]
+            try:
+                out["be10"] = _fred_series(cfg["be10"], start)
+            except Exception:  # noqa: BLE001  optional
+                pass
     elif cfg["src"] == "ecb":
         base = "https://data-api.ecb.europa.eu/service/data/"
         yc = parse_ecb_csv(_get(f"{base}YC/B.U2.EUR.4F.G_N_A.SV_C_YM.{'+'.join(codes)}"
@@ -236,12 +289,15 @@ def assemble_public(frames: dict[str, pd.DataFrame], start: dt.date, end: dt.dat
 
 def fetch_public(start: dt.date, end: dt.date) -> tuple[pd.DataFrame, list[str]]:
     """Free government-bond and fixing data from FRED, ECB, BoE and Bank of Canada."""
+    from concurrent.futures import ThreadPoolExecutor
     frames, problems = {}, []
-    for c, cfg in PUBLIC.items():
-        try:
-            frames[c] = _fetch_source(c, cfg, start)
-        except Exception as e:  # noqa: BLE001
-            problems.append(f"{PUBLIC_LABEL[c]}: {type(e).__name__}: {e}"[:200])
+    with ThreadPoolExecutor(max_workers=len(PUBLIC)) as ex:
+        futs = {c: ex.submit(_fetch_source, c, cfg, start, end) for c, cfg in PUBLIC.items()}
+        for c, fu in futs.items():
+            try:
+                frames[c] = fu.result()
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"{PUBLIC_LABEL[c]}: {type(e).__name__}: {e}"[:200])
     missing_core = [c for c in CCYS if c not in frames]
     if missing_core:
         raise RuntimeError("Public data unavailable for " + ", ".join(c.upper() for c in missing_core)
